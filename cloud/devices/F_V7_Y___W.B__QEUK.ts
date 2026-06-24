@@ -10,8 +10,9 @@
 //   1. LATCH: snapshot the last armed program off the status frame and persist it
 //      to /data, so it survives add-on / HA restarts.
 //   2. RESTORE: a 'remote_start_saved' button drives a small state machine that
-//      wakes the device if asleep and then sends an f026 "start with this config"
-//      command built from the latched snapshot.
+//      wakes the device ONLY if it is asleep (power-on is a toggle here, so waking
+//      an already-awake device would switch it off) and then sends an f026 "start
+//      with this config" command built from the latched snapshot.
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import F_V8 from './F_V8_Y___W.B_2QEUK'
 import { allowExtendedType } from '@/util/casting'
@@ -21,18 +22,23 @@ import { type Metadata } from '../thinq'
 
 type SavedConfig = { course: number; spin: number; temp: number }
 
-// IDLE: nothing pending. WAKING: wake sent, waiting for an awake status frame.
-// STARTING: transient, while the f026 is built and sent before returning to IDLE.
+// IDLE: nothing pending. WAKING: wake sent, waiting for the device to wake (its
+// course goes from 0/unknown back to a real program). STARTING: transient, while
+// the f026 is built and sent before returning to IDLE.
 type FsmState = 'IDLE' | 'WAKING' | 'STARTING'
 
-// Guard timeout: if no awake frame arrives after the wake, give up instead of
-// hanging forever (design: "esperar el frame, no delays", with a safety timeout).
+// Guard timeout: if the device never reports as awake after the wake, give up
+// instead of hanging forever (design: "esperar el frame", with a safety timeout).
 const WAKE_TIMEOUT_MS = 30_000
 
 export default class Device extends F_V8 {
-    // last status byte seen on the wire; the wake FSM uses it to tell a sleeping
-    // device (status 0) from an awake one.
-    private lastStatus = 0
+    // Last course byte and remote_start flag seen on the wire. The wake FSM uses
+    // these to detect "asleep": this washer clears state sequentially when it sleeps
+    // (spin/temp first, then course to 0 in the last frame before it goes silent), so
+    // a truly-asleep device is always course==0 with remote_start still armed.
+    // (Validated on-device by the user. The status byte is NOT reliable here.)
+    private lastCourse = 0
+    private lastRemoteStart = false
     private savedConfig?: SavedConfig
     // serialized form of what is currently on disk, so we only write when it changes.
     private persistedConfig?: string
@@ -89,21 +95,25 @@ export default class Device extends F_V8 {
 
         if (buf.length !== 80 || buf[0] !== 0x20) return
 
-        const status = buf[43]
         const course = buf[48]
         const spin = buf[51]
         const temp = buf[52]
         const remoteStart = buf[58] & 2
 
-        // Always track the live status so the wake FSM reacts to the real device
-        // state instead of guessing with delays (design decision #2/#3).
-        this.lastStatus = status
+        // Track course + armed flag so the wake FSM can detect asleep/awake from the
+        // real device state (design decision #2/#3).
+        this.lastCourse = course
+        this.lastRemoteStart = !!remoteStart
 
-        // LATCH: remember the program only while it is real and armed. The firmware
-        // wipes course/spin/temp on sleep, so we snapshot it while remote_start is
-        // armed and the course is still valid (!= 0). Persist only on change to avoid
-        // rewriting /data on every status frame (design decision #1).
-        if (remoteStart && course !== 0) {
+        // LATCH: remember the program only while it is a FULLY valid armed program.
+        // When the firmware sleeps it keeps remote_start armed but corrupts the frame:
+        // course may still read non-zero (seen: 7) while spin/temp drop to 0, which are
+        // invalid indices (SPINS/TEMPERATURES start at 1; 0 == "unknown"). Requiring all
+        // three != 0 rejects those sleep frames so they cannot clobber the real snapshot
+        // taken while awake. (Confirmed by capture: a sleep frame reported course=7
+        // spin=0 temp=0 and overwrote a good Sports Wear 8/2/2.) Persist only on change
+        // to avoid rewriting /data on every status frame (design decision #1).
+        if (remoteStart && course !== 0 && spin !== 0 && temp !== 0) {
             const next: SavedConfig = { course, spin, temp }
             const serialized = JSON.stringify(next)
             if (serialized !== this.persistedConfig) {
@@ -117,13 +127,24 @@ export default class Device extends F_V8 {
             }
         }
 
-        // Wake FSM: the device we were waking is now awake -> send the saved config.
-        if (this.fsm === 'WAKING' && status > 0) {
+        // Wake FSM: a device we were waking reports a real course again (course != 0)
+        // -> it is awake, so send the saved config.
+        if (this.fsm === 'WAKING' && course !== 0) {
             this.clearWakeTimer()
             this.fsm = 'STARTING'
             this.sendF026()
             this.fsm = 'IDLE'
         }
+    }
+
+    // Asleep == course reads 0 while remote_start is still armed. The firmware clears
+    // state sequentially on sleep and the final pre-sleep frame always drops course to
+    // 0, so course==0 + armed uniquely identifies a truly-asleep device. An awake,
+    // armed program always reports a real (non-zero) course, so this never misreads
+    // awake as asleep — which matters: the wake is a toggle that would power an awake
+    // device OFF.
+    private isAsleep(): boolean {
+        return this.lastRemoteStart && this.lastCourse === 0
     }
 
     setProperty(prop: string, mqttValue: string) {
@@ -134,28 +155,37 @@ export default class Device extends F_V8 {
         super.setProperty(prop, mqttValue) // power/pause/start of F_V8 untouched
     }
 
-    // Drives IDLE -> (WAKING) -> STARTING -> IDLE. A re-trigger restarts the
-    // sequence from scratch (clears any pending wake/timeout and re-evaluates).
+    // Drives IDLE -> (WAKING) -> STARTING -> IDLE.
     private executeRemoteStart() {
         if (!this.savedConfig) {
             console.warn(`F_V7 ${this.id}: remote_start_saved pressed but no saved config; ignoring`)
             return
         }
 
-        this.clearWakeTimer()
+        // Re-trigger guard: never restart mid-sequence. The wake (F02A0100) is a
+        // TOGGLE on this washer, so re-sending it while already WAKING would turn the
+        // device back OFF. Ignore presses until the current sequence settles.
+        if (this.fsm !== 'IDLE') {
+            console.info(`F_V7 ${this.id}: remote start already in progress (${this.fsm}); ignoring press`)
+            return
+        }
 
-        if (this.lastStatus === 0) {
-            // Device asleep: wake it, then wait for the next awake frame (no fixed delay).
-            console.info(`F_V7 ${this.id}: device asleep, sending wake before saved start`)
+        if (this.isAsleep()) {
+            // Asleep: toggle it on, then wait for it to report a known course (= awake)
+            // before starting. Send the wake ONLY here, where we have confirmed it is
+            // asleep — the toggle would power an awake device OFF.
+            console.info(`F_V7 ${this.id}: device asleep (course unknown + armed), sending wake`)
             this.fsm = 'WAKING'
             this.send(Buffer.from('F02A0100', 'hex'))
             this.wakeTimer = setTimeout(() => {
-                console.warn(`F_V7 ${this.id}: timed out waiting for wake frame; aborting remote start`)
+                console.warn(`F_V7 ${this.id}: timed out waiting for device to wake; aborting`)
                 this.fsm = 'IDLE'
                 this.wakeTimer = undefined
             }, WAKE_TIMEOUT_MS)
         } else {
-            // Already awake: start immediately.
+            // Already awake: start directly. Do NOT send the wake toggle (it would
+            // power the device off).
+            console.info(`F_V7 ${this.id}: device awake, starting saved config directly`)
             this.fsm = 'STARTING'
             this.sendF026()
             this.fsm = 'IDLE'
@@ -176,8 +206,14 @@ export default class Device extends F_V8 {
     // (byte 6 = rinse=normal, byte 8 = delay=off, byte 12 = 03 = start; fixed for v1.)
     private sendF026() {
         const cfg = this.savedConfig
-        if (!cfg) {
-            console.warn(`F_V7 ${this.id}: sendF026 with no saved config; skipping`)
+        // Refuse to send an incomplete config: sending spin/temp = 0 (invalid indices)
+        // makes the device ack the command but never start. This also guards against a
+        // stale snapshot persisted before the latch was tightened.
+        if (!cfg || !cfg.course || !cfg.spin || !cfg.temp) {
+            console.warn(
+                `F_V7 ${this.id}: saved config missing/incomplete (${JSON.stringify(cfg)}); ` +
+                    `arm a full program (course/spin/temp) first. Skipping f026.`,
+            )
             return
         }
         const inner = Buffer.from([
