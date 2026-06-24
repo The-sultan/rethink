@@ -22,9 +22,10 @@ import { type Metadata } from '../thinq'
 
 type SavedConfig = { course: number; spin: number; temp: number }
 
-// IDLE: nothing pending. WAKING: wake sent, waiting for the device to wake (its
-// course goes from 0/unknown back to a real program). STARTING: transient, while
-// the f026 is built and sent before returning to IDLE.
+// IDLE: nothing pending. WAKING: wake sent, waiting for the device to resume
+// transmitting (it is silent while asleep, so ANY frame means it woke — its course
+// stays 0 because the firmware forgot the program). STARTING: transient, while the
+// f026 is built and sent before returning to IDLE.
 type FsmState = 'IDLE' | 'WAKING' | 'STARTING'
 
 // Guard timeout: if the device never reports as awake after the wake, give up
@@ -127,9 +128,11 @@ export default class Device extends F_V8 {
             }
         }
 
-        // Wake FSM: a device we were waking reports a real course again (course != 0)
-        // -> it is awake, so send the saved config.
-        if (this.fsm === 'WAKING' && course !== 0) {
+        // Wake FSM: while asleep the device is SILENT, so reaching here (a valid 80-byte
+        // frame) means it resumed transmitting = it is awake. We cannot gate on course:
+        // the firmware forgot the program, so course stays 0 after waking until our f026
+        // sets it. So send the saved config on the first frame after the wake.
+        if (this.fsm === 'WAKING') {
             this.clearWakeTimer()
             this.fsm = 'STARTING'
             this.sendF026()
